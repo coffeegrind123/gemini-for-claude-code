@@ -1,8 +1,13 @@
 # FOR OFFICIAL GOOGLE AI CLI TOOL SEE https://github.com/google-gemini/gemini-cli
 
-# Gemini for Claude Code: An Anthropic-Compatible Proxy
+# Claude Code Proxy: Multi-Provider Support for Claude Code
 
-This server acts as a bridge, enabling you to use **Claude Code** with Google's powerful **Gemini models**. It translates API requests and responses between the Anthropic format (used by Claude Code) and the Gemini format (via LiteLLM), allowing seamless integration.
+This server acts as a bridge, enabling you to use **Claude Code** with multiple AI providers including **Google Gemini models**. It translates API requests and responses between the Anthropic format (used by Claude Code) and various provider formats (via LiteLLM), allowing seamless integration.
+
+**Currently supported providers:**
+- ✅ **Google Gemini** (all models including 2.5 Pro/Flash)
+- 🚧 **OpenAI** (coming soon)
+- 🚧 **Other providers** (planned)
 
 ![Claude Code with Gemini Proxy](image.png)
 
@@ -18,19 +23,25 @@ This server acts as a bridge, enabling you to use **Claude Code** with Google's 
 - **Diagnostic Endpoints**: Includes `/health` and `/test-connection` for easier troubleshooting of your setup.
 - **Token Counting**: Offers a `/v1/messages/count_tokens` endpoint compatible with Claude Code.
 
-## Recent Improvements (v2.5.0)
+## Recent Improvements
 
-### 🛡️ Enhanced Error Resilience
-- **Malformed Chunk Recovery**: Automatically detects and handles malformed JSON chunks from Gemini streaming
-- **Smart Retry Logic**: Exponential backoff with configurable retry limits for streaming errors
-- **Graceful Fallback**: Seamlessly switches to non-streaming mode when streaming fails
-- **Buffer Management**: Intelligent chunk buffering and reconstruction for incomplete JSON
-- **Connection Stability**: Handles Gemini 500 Internal Server Errors with automatic retry
+### 🚀 **Transformed into User-Friendly Tool**
+- **One-Command Installation**: `./install.sh` handles everything automatically
+- **Secure Configuration**: API keys stored safely outside repository in `~/.config/`
+- **System Integration**: Native systemd/launchd service support with auto-restart
+- **CLI Interface**: Simple commands like `claude-proxy start`, `stop`, `status`, `config`
 
-### 📊 Improved Monitoring
-- **Detailed Error Classification**: Specific guidance for different types of Gemini API errors
-- **Enhanced Logging**: Comprehensive error tracking with malformed chunk statistics
-- **Real-time Status**: Better health checks and connection testing
+### 🔧 **Enhanced Functionality** 
+- **Dynamic Model Discovery**: Auto-detects available Gemini models via API
+- **Smart Model Selection**: Fast mode testing for optimal model recommendations
+- **Updated Defaults**: Uses latest Gemini 2.0/2.5 models by default
+- **Comprehensive Testing**: Multi-tier test suite with rate limit protection
+
+### 🛡️ **Improved Reliability**
+- **Malformed Chunk Recovery**: Automatically handles broken JSON from Gemini streaming
+- **Smart Retry Logic**: Exponential backoff with configurable retry limits
+- **Graceful Fallback**: Seamlessly switches to non-streaming when needed
+- **Enhanced Error Handling**: Specific guidance for different Gemini API issues
 
 ## Prerequisites
 
@@ -46,64 +57,76 @@ This server acts as a bridge, enabling you to use **Claude Code** with Google's 
     cd gemini-code
     ```
 
-2.  **Create and activate a virtual environment** (recommended):
+2.  **Install system-wide** (Recommended):
     ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate
+    ./install.sh
+    ```
+    This automatically handles:
+    - Virtual environment creation
+    - Dependency installation  
+    - System integration
+    - Secure configuration setup
+
+3.  **Configure and start**:
+    ```bash
+    claude-proxy config  # Interactive setup
+    claude-proxy start   # Start the proxy
     ```
 
-3.  **Install dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
+## Quick Start
 
-4.  **Configure Environment Variables**:
-    Copy the example environment file:
-    ```bash
-    cp .env.example .env
-    ```
-    Edit `.env` and add your Gemini API key. You can also customize model mappings and server settings:
-    ```dotenv
-    # Required: Your Google AI Studio API key
-    GEMINI_API_KEY="your-google-ai-studio-key"
+### Method 1: Installed System-Wide (Recommended)
 
-    # Optional: Model mappings for Claude Code aliases
-    BIG_MODEL="gemini-1.5-pro-latest"    # For 'sonnet' or 'opus' requests
-    SMALL_MODEL="gemini-1.5-flash-latest" # For 'haiku' requests
+First install the proxy system-wide:
+```bash
+./install.sh
+```
+
+Then use the installed CLI from anywhere:
+```bash
+# Configure the proxy (interactive setup)
+claude-proxy config
+
+# Start the proxy server
+claude-proxy start
+
+# Check status and get connection info
+claude-proxy status
+
+# Validate and optimize model selection
+claude-proxy models --update-config
+
+# Stop the server
+claude-proxy stop
+```
+
+### Method 2: Run from Repository (Development)
+
+For development or testing without installation:
+```bash
+# Configure the proxy (interactive setup)
+./claude-proxy config
+
+# Start the proxy server
+./claude-proxy start
+
+# Check status and get connection info
+./claude-proxy status
+
+# Stop the server
+./claude-proxy stop
+```
+
+### Usage with Claude Code
+
+1.  **Start the Proxy Server**: Ensure the proxy server is running:
+    ```bash
+    # If installed system-wide:
+    claude-proxy start
     
-    # Optional: Server settings
-    HOST="0.0.0.0"
-    PORT="8082"
-    LOG_LEVEL="WARNING"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-    
-    # Optional: Performance and reliability settings
-    MAX_TOKENS_LIMIT="8192"           # Max tokens for Gemini responses
-    REQUEST_TIMEOUT="90"              # Request timeout in seconds
-    MAX_RETRIES="2"                   # LiteLLM retries to Gemini
-    MAX_STREAMING_RETRIES="12"         # Streaming-specific retry attempts
-    
-    # Optional: Streaming control (use if experiencing issues)
-    FORCE_DISABLE_STREAMING="false"     # Disable streaming globally
-    EMERGENCY_DISABLE_STREAMING="false" # Emergency streaming disable
+    # Or if running from repository:
+    ./claude-proxy start
     ```
-
-5.  **Run the server**:
-    The `server.py` script includes a `main()` function that starts the Uvicorn server:
-    ```bash
-    python server.py
-    ```
-    For development with auto-reload (restarts when you save changes to `server.py`):
-    ```bash
-    uvicorn server:app --host 0.0.0.0 --port 8082 --reload
-    ```
-    You can view all startup options, including configurable environment variables, by running:
-    ```bash
-    python server.py --help
-    ```
-
-## Usage with Claude Code
-
-1.  **Start the Proxy Server**: Ensure the Gemini proxy server (this application) is running (see step 5 above).
 
 2.  **Configure Claude Code to Use the Proxy**:
     Set the `ANTHROPIC_BASE_URL` environment variable when running Claude Code:
@@ -132,7 +155,7 @@ This server acts as a bridge, enabling you to use **Claude Code** with Google's 
 2.  **Anthropic Format**: Claude Code sends an API request (in Anthropic's Messages API format) to the proxy server's address (`http://localhost:8082`).
 3.  **Proxy Translation (Anthropic to Gemini)**: The proxy server:
     *   Receives the Anthropic-formatted request.
-    *   Validates it and maps any Claude model aliases (like `claude-3-sonnet...`) to the corresponding Gemini model specified in your `.env` (e.g., `gemini-1.5-pro-latest`).
+    *   Validates it and maps any Claude model aliases (like `claude-3-sonnet...`) to the corresponding Gemini model specified in your configuration (e.g., `gemini-2.0-flash-exp`).
     *   Translates the message structure, content blocks, and tool definitions into a format LiteLLM can use with the Gemini API.
 4.  **LiteLLM to Gemini**: LiteLLM sends the prepared request to the target Gemini model using your `GEMINI_API_KEY`.
 5.  **Gemini Response**: Gemini processes the request and sends its response back through LiteLLM.
@@ -146,8 +169,8 @@ This server acts as a bridge, enabling you to use **Claude Code** with Google's 
 
 To ensure Claude Code's model requests are handled correctly by Gemini:
 
-- Requests from Claude Code for model names containing **"haiku"** (e.g., `claude-3-haiku-20240307`) are mapped to the Gemini model specified by your `SMALL_MODEL` environment variable (default: `gemini-1.5-flash-latest`).
-- Requests from Claude Code for model names containing **"sonnet"** or **"opus"** (e.g., `claude-3-sonnet-20240229`, `claude-3-opus-20240229`) are mapped to the Gemini model specified by your `BIG_MODEL` environment variable (default: `gemini-1.5-pro-latest`).
+- Requests from Claude Code for model names containing **"haiku"** (e.g., `claude-3-haiku-20240307`) are mapped to the Gemini model specified by your `SMALL_MODEL` configuration (default: `gemini-1.5-flash-latest`).
+- Requests from Claude Code for model names containing **"sonnet"** or **"opus"** (e.g., `claude-3-sonnet-20240229`, `claude-3-opus-20240229`) are mapped to the Gemini model specified by your `BIG_MODEL` configuration (default: `gemini-2.0-flash-exp`).
 - If Claude Code requests a full Gemini model name (e.g., `gemini/gemini-1.5-pro-latest`), the proxy will use that directly.
 
 The server maintains a list of known Gemini models. If a recognized Gemini model is requested by the client without the `gemini/` prefix, the proxy will add it.
@@ -196,7 +219,7 @@ export FORCE_DISABLE_STREAMING=true
 
 ## Logging
 
-The server provides detailed logs, which are especially useful for understanding how Claude Code requests are translated for Gemini and for monitoring error recovery. Logs are colorized in TTY environments for easier reading. Adjust verbosity with the `LOG_LEVEL` environment variable:
+The server provides detailed logs, which are especially useful for understanding how Claude Code requests are translated for Gemini and for monitoring error recovery. Logs are colorized in TTY environments for easier reading. Adjust verbosity in your configuration or with the `LOG_LEVEL` environment variable:
 
 - `DEBUG`: Detailed request/response logging and error recovery steps
 - `INFO`: General operation logging
@@ -221,9 +244,39 @@ When you run `claude` in a project directory, the Claude Code CLI automatically 
 
 **Recommendation:** Always copy the `CLAUDE.MD` from this proxy's repository into the root of any project where you intend to use Claude Code with this Gemini proxy. This ensures Gemini receives these vital instructions for every session.
 
+## Testing
+
+The proxy includes a comprehensive test suite to verify functionality:
+
+```bash
+# Install test dependencies (if not already installed)
+pip install aiohttp
+
+# Run all tests (includes API calls - may hit rate limits with frequent use)
+make test
+
+# Run quick tests (no API calls, just health checks)
+make test-quick
+
+# Run minimal API tests (single connectivity test to avoid rate limits)
+make test-minimal
+
+# Debug model availability and rate limits
+python3 test_proxy.py --debug-models
+```
+
+**Test Modes:**
+- **Quick**: Basic connectivity (no API usage)
+- **Minimal**: Single API call to verify connection
+- **Full**: Comprehensive testing (may trigger rate limits)
+- **Debug**: Test all available Gemini models to identify working ones
+
+The tests automatically read your configuration and test the appropriate endpoints.
+
 ## Performance Tips
 
-- **Model Selection**: Use `gemini-1.5-flash-latest` for faster responses, `gemini-1.5-pro-latest` for more complex tasks
+- **Model Selection**: Use `gemini-1.5-flash-latest` for faster responses, `gemini-2.0-flash-exp` for more complex tasks with the latest capabilities
+- **Model Availability**: Different Gemini models have different rate limits and availability - use the debug test to identify which models work with your API key
 - **Streaming**: Keep streaming enabled for better interactivity; the proxy handles errors automatically
 - **Timeouts**: Increase `REQUEST_TIMEOUT` for complex requests that need more processing time
 - **Retries**: Adjust `MAX_STREAMING_RETRIES` based on your network stability

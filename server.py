@@ -60,7 +60,7 @@ class Config:
         if not self.gemini_api_key:
             raise ValueError("GEMINI_API_KEY not found in environment variables")
         
-        self.big_model = os.environ.get("BIG_MODEL", "gemini-1.5-pro-latest")
+        self.big_model = os.environ.get("BIG_MODEL", "gemini-2.0-flash-exp")
         self.small_model = os.environ.get("SMALL_MODEL", "gemini-1.5-flash-latest")
         self.host = os.environ.get("HOST", "0.0.0.0")
         self.port = int(os.environ.get("PORT", "8082"))
@@ -183,7 +183,7 @@ root_logger.addFilter(SimpleMessageFilter())
 for uvicorn_logger in ["uvicorn", "uvicorn.access", "uvicorn.error"]:
     logging.getLogger(uvicorn_logger).setLevel(logging.WARNING)
 
-app = FastAPI(title="Gemini-to-Claude API Proxy", version="2.5.0")
+app = FastAPI(title="Claude Code Multi-Provider Proxy")
 
 # Enhanced error classification
 def classify_gemini_error(error_msg: str) -> str:
@@ -1208,7 +1208,7 @@ async def health_check():
         health_status = {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
-            "version": "2.5.0",
+            "version": "dev",
             "gemini_api_configured": bool(config.gemini_api_key),
             "api_key_valid": config.validate_api_key(),
             "streaming_config": {
@@ -1287,7 +1287,7 @@ async def test_connection():
 @app.get("/")
 async def root():
     return {
-        "message": f"Enhanced Gemini-to-Claude API Proxy v2.5.0",
+        "message": f"Claude Code Multi-Provider Proxy",
         "status": "running",
         "config": {
             "big_model": config.big_model,
@@ -1371,7 +1371,7 @@ def validate_startup():
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--help":
-        print("Enhanced Gemini-to-Claude API Proxy v2.5.0")
+        print("Claude Code Multi-Provider Proxy")
         print("")
         print("Usage: uvicorn server:app --reload --host 0.0.0.0 --port 8082")
         print("")
@@ -1402,7 +1402,7 @@ def main():
         sys.exit(1)
 
     # Configuration summary
-    print("🚀 Enhanced Gemini-to-Claude API Proxy v2.5.0")
+    print("🚀 Claude Code Multi-Provider Proxy")
     print(f"✅ Configuration loaded successfully")
     print(f"   Big Model: {config.big_model}")
     print(f"   Small Model: {config.small_model}")

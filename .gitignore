@@ -1,0 +1,79 @@
+# Configuration files (now stored in user config directory)
+.env
+config.env
+gemini-code.json
+gemini-code.yml
+
+# Legacy config files (should not be here anymore)
+*.env
+config.*
+
+# Process files
+*.pid
+.gemini-code.pid
+.health-monitor.pid
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+
+# Test files
+test_*.json
+test_results/
+
+# Temporary files
+tmp/
+temp/
+
+# Claude Code specific
+.claude/
+.claude-*
+claude-code.db
+claude-memory.json
+.ai-context.json

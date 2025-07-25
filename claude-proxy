@@ -255,6 +255,12 @@ class ClaudeProxyCLI:
                 elif streaming_config.get('emergency_disabled'):
                     streaming_status = "emergency disabled"
                 print(f"   Streaming: {streaming_status}")
+                
+                # Show request statistics if available
+                stats = health.get('statistics', {})
+                if stats.get('total_requests', 0) > 0:
+                    print(f"   Requests: {stats.get('total_requests', 0)} total, {stats.get('successful_requests', 0)} successful")
+                    print(f"   Rate: {stats.get('requests_per_minute', 0):.1f} req/min, uptime: {stats.get('uptime_seconds', 0):.0f}s")
             else:
                 print("   Health: Unable to connect")
         else:
@@ -636,12 +642,21 @@ class ClaudeProxyCLI:
             subprocess.run(['tail', '-50', str(log_file)])
 
 def main():
-    parser = argparse.ArgumentParser(description='Claude Code Proxy - Multi-provider proxy for Claude Code')
+    parser = argparse.ArgumentParser(
+        description='Claude Code Proxy - Multi-provider proxy for Claude Code',
+        epilog='Examples:\n'
+               '  claude-proxy start                    # Start as daemon\n'
+               '  claude-proxy start --foreground       # Start in foreground\n'
+               '  LOG_LEVEL=INFO claude-proxy start -f  # Start with request debugging\n'
+               '  claude-proxy status                    # Show status and statistics',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # Start command
     start_parser = subparsers.add_parser('start', help='Start the proxy server')
-    start_parser.add_argument('--foreground', '-f', action='store_true', help='Run in foreground')
+    start_parser.add_argument('--foreground', '-f', action='store_true', 
+                             help='Run in foreground with logs visible. Use LOG_LEVEL=INFO for request debugging')
     
     # Stop command
     subparsers.add_parser('stop', help='Stop the proxy server')

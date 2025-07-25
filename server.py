@@ -96,6 +96,35 @@ except Exception as e:
 litellm.request_timeout = config.request_timeout
 litellm.num_retries = config.max_retries
 
+# Request Statistics
+class RequestStats:
+    def __init__(self):
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.start_time = time.time()
+    
+    def increment_request(self):
+        self.total_requests += 1
+    
+    def increment_success(self):
+        self.successful_requests += 1
+    
+    def increment_failure(self):
+        self.failed_requests += 1
+    
+    def get_stats(self):
+        uptime = time.time() - self.start_time
+        return {
+            'total_requests': self.total_requests,
+            'successful_requests': self.successful_requests,
+            'failed_requests': self.failed_requests,
+            'uptime_seconds': uptime,
+            'requests_per_minute': (self.total_requests / uptime * 60) if uptime > 0 else 0
+        }
+
+request_stats = RequestStats()
+
 # Model Management
 class ModelManager:
     def __init__(self, config):
@@ -1027,13 +1056,34 @@ async def handle_streaming_with_recovery(response_generator, original_request: M
     except Exception as final_error:
         logger.error(f"Error sending final SSE events: {final_error}")
 
-# Request Middleware
+# Request Middleware - Enhanced for debugging
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     method = request.method
     path = request.url.path
-    logger.debug(f"Request: {method} {path}")
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    
+    # Increment request counter for all requests
+    request_stats.increment_request()
+    
+    # Always log incoming requests at INFO level for debugging
+    logger.info(f"🔍 INCOMING REQUEST #{request_stats.total_requests}: {method} {path} from {client_ip}")
+    logger.info(f"📋 Headers: User-Agent: {user_agent}")
+    logger.info(f"📋 Authorization: {'Present' if 'authorization' in request.headers else 'Missing'}")
+    
+    start_time = time.time()
     response = await call_next(request)
+    duration = time.time() - start_time
+    
+    # Update success/failure counters
+    if response.status_code < 400:
+        request_stats.increment_success()
+        logger.info(f"✅ RESPONSE #{request_stats.total_requests}: {response.status_code} ({duration:.2f}s)")
+    else:
+        request_stats.increment_failure()
+        logger.info(f"❌ RESPONSE #{request_stats.total_requests}: {response.status_code} ({duration:.2f}s)")
+    
     return response
 
 # Enhanced streaming retry logic for the main endpoint
@@ -1205,6 +1255,7 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
 @app.get("/health")
 async def health_check():
     try:
+        stats = request_stats.get_stats()
         health_status = {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
@@ -1215,6 +1266,13 @@ async def health_check():
                 "force_disabled": config.force_disable_streaming,
                 "emergency_disabled": config.emergency_disable_streaming,
                 "max_retries": config.max_streaming_retries
+            },
+            "statistics": {
+                "total_requests": stats["total_requests"],
+                "successful_requests": stats["successful_requests"],
+                "failed_requests": stats["failed_requests"],
+                "uptime_seconds": round(stats["uptime_seconds"], 2),
+                "requests_per_minute": round(stats["requests_per_minute"], 2)
             }
         }
         
@@ -1415,6 +1473,16 @@ def main():
     print(f"   Emergency Disable Streaming: {config.emergency_disable_streaming}")
     print(f"   Log Level: {config.log_level}")
     print(f"   Server: {config.host}:{config.port}")
+    print("")
+
+    # Clear startup message for debugging
+    print(f"🔍 DEBUG: Starting server with enhanced request logging at {config.host}:{config.port}")
+    print(f"🔍 DEBUG: Current log level: {config.log_level}")
+    if config.log_level.upper() not in ['DEBUG', 'INFO']:
+        print(f"⚠️  WARNING: Log level is {config.log_level} - set LOG_LEVEL=INFO to see request debugging")
+        print(f"   To debug: LOG_LEVEL=INFO claude-proxy start --foreground")
+    print(f"🔍 DEBUG: Waiting for Claude Code requests at /v1/messages")
+    print(f"🔍 DEBUG: All incoming requests will be logged with '🔍 INCOMING REQUEST'")
     print("")
 
     # Start server

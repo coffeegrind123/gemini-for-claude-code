@@ -222,10 +222,22 @@ export FORCE_DISABLE_STREAMING=true
 The server provides detailed logs, which are especially useful for understanding how Claude Code requests are translated for Gemini and for monitoring error recovery. Logs are colorized in TTY environments for easier reading. Adjust verbosity in your configuration or with the `LOG_LEVEL` environment variable:
 
 - `DEBUG`: Detailed request/response logging and error recovery steps
-- `INFO`: General operation logging
+- `INFO`: General operation logging with request debugging
 - `WARNING`: Error recovery and fallback notifications (recommended)
 - `ERROR`: Only errors and failures
 - `CRITICAL`: Only critical failures
+
+### Debugging Request Issues
+
+If Claude Code isn't connecting to the proxy, run with enhanced logging:
+
+```bash
+# For debugging - run in foreground with request logging
+LOG_LEVEL=INFO claude-proxy start --foreground
+
+# You should see incoming requests marked with 🔍 INCOMING REQUEST
+# If no requests appear, check ANTHROPIC_BASE_URL is set correctly
+```
 
 ## The `CLAUDE.MD` File: Guiding Gemini for Claude Code
 

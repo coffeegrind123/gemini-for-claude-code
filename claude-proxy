@@ -103,20 +103,27 @@ class ClaudeProxyCLI:
 
     def is_server_running(self) -> bool:
         """Check if the server is currently running"""
-        if not self.pid_file.exists():
-            return False
-        
-        try:
-            with open(self.pid_file, 'r') as f:
-                pid = int(f.read().strip())
-            
-            # Check if process is still running
-            os.kill(pid, 0)
-            return True
-        except (OSError, ValueError, ProcessLookupError):
-            # Process not found or PID file corrupted
-            if self.pid_file.exists():
+        # First check if we have a PID file (daemon mode)
+        if self.pid_file.exists():
+            try:
+                with open(self.pid_file, 'r') as f:
+                    pid = int(f.read().strip())
+                
+                # Check if process is still running
+                os.kill(pid, 0)
+                return True
+            except (OSError, ValueError, ProcessLookupError):
+                # Process not found or PID file corrupted
                 self.pid_file.unlink()
+        
+        # If no PID file, check if server responds to health check (foreground mode)
+        try:
+            config = self.load_config()
+            port = config.get('PORT', '8082')
+            import urllib.request
+            urllib.request.urlopen(f'http://localhost:{port}/health', timeout=2)
+            return True
+        except:
             return False
 
     def get_server_status(self) -> Dict[str, Any]:
@@ -239,7 +246,10 @@ class ClaudeProxyCLI:
         
         if status['running']:
             print("✅ Server is running")
-            print(f"   PID: {status['pid']}")
+            if status['pid']:
+                print(f"   PID: {status['pid']} (daemon mode)")
+            else:
+                print(f"   Mode: foreground (no PID file)")
             print(f"   Port: {config.get('PORT', '8082')}")
             
             if status['health']:

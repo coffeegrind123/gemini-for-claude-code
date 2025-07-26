@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 import uvicorn
 import logging
 import json
@@ -75,6 +75,12 @@ class Config:
         self.max_streaming_retries = int(os.environ.get("MAX_STREAMING_RETRIES", "12"))
         self.force_disable_streaming = os.environ.get("FORCE_DISABLE_STREAMING", "false").lower() == "true"
         self.emergency_disable_streaming = os.environ.get("EMERGENCY_DISABLE_STREAMING", "false").lower() == "true"
+        
+        # Rate limit retry settings
+        self.max_retry_time = int(os.environ.get("MAX_RETRY_TIME", "60"))  # Bail if cumulative retry time exceeds this
+        self.max_single_retry_delay = int(os.environ.get("MAX_SINGLE_RETRY_DELAY", "30"))  # Bail if single retry delay exceeds this
+        
+        # All retries are now handled by Claude Code - proxy only returns appropriate HTTP status codes
         
     def validate_api_key(self):
         """Basic API key validation"""
@@ -215,6 +221,183 @@ for uvicorn_logger in ["uvicorn", "uvicorn.access", "uvicorn.error"]:
 app = FastAPI(title="Claude Code Multi-Provider Proxy")
 
 # Enhanced error classification
+def parse_gemini_error_details(error_msg: str) -> dict:
+    """Parse Gemini error response to extract quota/rate limit details."""
+    try:
+        # Look for JSON in the error message - handle bytes format like b'{...}'
+        import json
+        import re
+        
+        # Debug logging to see what we're trying to parse
+        logger.debug(f"🔧 Parsing error message (length: {len(error_msg)})")
+        logger.debug(f"🔧 First 500 chars: {error_msg[:500]}")
+        
+        # First try to extract from bytes format: b'{...}' (may be incomplete)
+        bytes_match = re.search(r"b'(\{.*)", error_msg, re.DOTALL)
+        if bytes_match:
+            json_str = bytes_match.group(1)
+            # Remove trailing quote if present
+            if json_str.endswith("'"):
+                json_str = json_str[:-1]
+            # Clean up escape sequences
+            json_str = json_str.replace('\\n', '\n').replace('\\"', '"')
+            logger.debug(f"🔧 Extracted JSON from bytes format (length: {len(json_str)})")
+            
+            # Try to parse - might be incomplete
+            try:
+                error_json = json.loads(json_str)
+            except json.JSONDecodeError:
+                # JSON might be truncated, try to find a valid closing point
+                for i in range(len(json_str) - 1, -1, -1):
+                    if json_str[i] == '}':
+                        try:
+                            error_json = json.loads(json_str[:i+1])
+                            logger.debug(f"🔧 Parsed truncated JSON at position {i}")
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                else:
+                    raise json.JSONDecodeError("Could not parse truncated JSON", json_str, 0)
+        else:
+            # Fallback to direct JSON match
+            json_match = re.search(r'\{.*\}', error_msg, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                logger.debug(f"🔧 Extracted JSON from direct match (length: {len(json_str)})")
+                error_json = json.loads(json_str)
+            else:
+                logger.debug("🔧 No JSON pattern found in error message")
+                raise ValueError("No JSON found in error message")
+        
+        # Extract key details
+        details = {
+            'error_code': error_json.get('error', {}).get('code'),
+            'error_status': error_json.get('error', {}).get('status'),
+            'message': error_json.get('error', {}).get('message', '')
+        }
+        
+        # Look for quota failure details
+        for detail in error_json.get('error', {}).get('details', []):
+            if detail.get('@type') == 'type.googleapis.com/google.rpc.QuotaFailure':
+                violations = detail.get('violations', [])
+                if violations:
+                    violation = violations[0]  # Get first violation
+                    details.update({
+                        'quota_metric': violation.get('quotaMetric', ''),
+                        'quota_id': violation.get('quotaId', ''),
+                        'quota_value': violation.get('quotaValue', ''),
+                        'quota_model': violation.get('quotaDimensions', {}).get('model', '')
+                    })
+            elif detail.get('@type') == 'type.googleapis.com/google.rpc.RetryInfo':
+                details['retry_delay'] = detail.get('retryDelay', '')
+        
+        return details
+    except (json.JSONDecodeError, KeyError, AttributeError, ValueError) as e:
+        logger.debug(f"🔧 JSON parsing failed: {type(e).__name__}: {e}")
+        pass
+    
+    # Fallback if parsing fails
+    return {'parsing_failed': True, 'raw_snippet': error_msg[:500] + '...' if len(error_msg) > 500 else error_msg}
+
+def handle_quota_rate_limit_error(error: Exception, request, config) -> HTTPException:
+    """Centralized handler for all quota and rate limit errors."""
+    error_str = str(error)
+    
+    # Determine model type for logging
+    effective_model = request.model or "unknown"
+    model_type = "unknown"
+    if config.big_model in effective_model:
+        model_type = "BIG"
+    elif config.small_model in effective_model:
+        model_type = "SMALL"
+    
+    # Parse detailed error information
+    quota_details = parse_gemini_error_details(error_str)
+    retry_delay = extract_retry_delay(error_str)
+    
+    # Improved quota vs rate limit detection based on quota metrics
+    quota_metric = quota_details.get('quota_metric', '').lower()
+    is_quota_exhausted = False
+    
+    # These quota metrics indicate true quota exhaustion (should return 400)
+    exhaustion_indicators = [
+        'requests_per_day',           # Daily request limits
+        'generate_content_free_tier_requests',  # Daily free tier request limits  
+        'tokens_per_day',             # Daily token limits
+        'characters_per_day'          # Daily character limits
+    ]
+    
+    # These quota metrics indicate temporary rate limits (should return 429)
+    rate_limit_indicators = [
+        'requests_per_minute',        # Per-minute request limits
+        'tokens_per_minute',          # Per-minute token limits  
+        'characters_per_minute'       # Per-minute character limits
+    ]
+    
+    # Check for quota exhaustion indicators
+    for indicator in exhaustion_indicators:
+        if indicator in quota_metric:
+            is_quota_exhausted = True
+            break
+    
+    # If not explicitly a quota exhaustion, check if it's a known rate limit
+    if not is_quota_exhausted:
+        for indicator in rate_limit_indicators:
+            if indicator in quota_metric:
+                is_quota_exhausted = False  # Definitely a rate limit
+                break
+        else:
+            # Fallback: if it contains "quota" or "free_tier" but we don't recognize the metric, assume quota exhaustion
+            is_quota_exhausted = "quota" in error_str.lower() or "free_tier" in error_str.lower()
+    
+    # Log comprehensive analysis
+    logger.info(f"📊 QUOTA/RATE LIMIT ERROR: quota_detected={is_quota_exhausted}, delay={retry_delay}s, model_type={model_type}, metric={quota_metric}")
+    logger.info(f"🔍 PARSED DETAILS: {quota_details}")
+    
+    if is_quota_exhausted:
+        logger.info(f"🚫 {model_type} model QUOTA EXHAUSTED, returning 400 to stop Claude Code retries")
+        # Use Google's actual message - HTTP 400 was working correctly before
+        google_message = quota_details.get('message', 'Quota exhausted. Please check your quota limits.')
+        return HTTPException(status_code=400, detail=google_message)
+    else:
+        logger.info(f"🚫 {model_type} model RATE LIMITED (not quota), returning 500 for Claude Code to retry properly")
+        # Use Google's message with retry context - 500 makes Claude Code retry properly
+        google_message = quota_details.get('message', 'Rate limited. Too many requests.')
+        detail_message = f"{google_message} (Google suggests waiting {retry_delay}s, but Claude Code will retry faster)"
+        return HTTPException(status_code=500, detail=detail_message)
+
+def extract_retry_delay(error_msg: str) -> int:
+    """Extract retry delay from Gemini rate limit error response."""
+    import re
+    import json
+    
+    # Try to parse the JSON error response
+    try:
+        # Look for JSON in the error message
+        json_match = re.search(r'\{.*\}', error_msg, re.DOTALL)
+        if json_match:
+            error_json = json.loads(json_match.group())
+            
+            # Look for RetryInfo in the details
+            if 'error' in error_json and 'details' in error_json['error']:
+                for detail in error_json['error']['details']:
+                    if detail.get('@type') == 'type.googleapis.com/google.rpc.RetryInfo':
+                        retry_delay_str = detail.get('retryDelay', '60s')
+                        # Extract number from string like "25s"
+                        delay_match = re.search(r'(\d+)', retry_delay_str)
+                        if delay_match:
+                            return int(delay_match.group(1))
+    except (json.JSONDecodeError, KeyError, ValueError):
+        pass
+    
+    # Fallback: look for retry delay in the error text
+    retry_match = re.search(r'retryDelay["\']?\s*:\s*["\']?(\d+)', error_msg, re.IGNORECASE)
+    if retry_match:
+        return int(retry_match.group(1))
+    
+    # Default fallback
+    return 60
+
 def classify_gemini_error(error_msg: str) -> str:
     """Provide specific error guidance for common Gemini issues."""
     error_lower = error_msg.lower()
@@ -230,9 +413,17 @@ def classify_gemini_error(error_msg: str) -> str:
         else:
             return "Tool schema validation error. Check your tool parameter definitions for unsupported format types or properties."
     
-    # Rate limiting
+    # Rate limiting with better quota vs rate limit distinction
     elif "rate limit" in error_lower or "quota" in error_lower:
-        return "Rate limit or quota exceeded. Please wait a moment and try again. Check your Google Cloud Console for quota limits."
+        retry_delay = extract_retry_delay(error_msg)
+        
+        # Detect quota vs rate limit
+        is_quota_exhausted = "quota" in error_lower or "free_tier" in error_lower
+        
+        if is_quota_exhausted:
+            return f"Quota exhausted. You've hit your free tier limits. Consider upgrading your Google AI Studio plan or try again later when your quota resets."
+        else:
+            return f"Rate limited. Too many requests - try again in a moment. (Google suggests waiting {retry_delay}s, but Claude Code will retry faster)"
     
     # Authentication issues
     elif "api key" in error_lower or "authentication" in error_lower or "unauthorized" in error_lower:
@@ -1015,6 +1206,26 @@ async def handle_streaming_with_recovery(response_generator, original_request: M
                     break
                     
             except Exception as general_error:
+                # Check if this is a rate limit error first
+                error_str = str(general_error)
+                if ("RateLimitError" in error_str or "RateLimitError" in type(general_error).__name__ or
+                    "rate limit" in error_str.lower() or "quota" in error_str.lower() or 
+                    "429" in error_str or "RESOURCE_EXHAUSTED" in error_str):
+                    
+                    retry_delay = extract_retry_delay(error_str)
+                    original_model = original_request.original_model or "unknown"
+                    effective_model = original_request.model or "unknown"
+                    
+                    # Determine if this was big/small model based on mapping
+                    model_type = "unknown"
+                    if config.big_model in effective_model:
+                        model_type = "BIG"
+                    elif config.small_model in effective_model:
+                        model_type = "SMALL"
+                    
+                    # Use centralized handler for all rate limits/quota errors
+                    raise handle_quota_rate_limit_error(general_error, original_request, config)
+                
                 consecutive_errors += 1
                 logger.error(f"Unexpected streaming error (attempt {consecutive_errors}/{max_consecutive_errors}): {general_error}")
                 
@@ -1068,7 +1279,7 @@ async def log_requests(request: Request, call_next):
     request_stats.increment_request()
     
     # Always log incoming requests at INFO level for debugging
-    logger.info(f"🔍 INCOMING REQUEST #{request_stats.total_requests}: {method} {path} from {client_ip}")
+    logger.info(f"🔍 INBOUND REQUEST #{request_stats.total_requests}: {method} {path} from {client_ip}")
     logger.info(f"📋 Headers: User-Agent: {user_agent}")
     logger.info(f"📋 Authorization: {'Present' if 'authorization' in request.headers else 'Missing'}")
     
@@ -1076,13 +1287,22 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     duration = time.time() - start_time
     
-    # Update success/failure counters
+    # Log outbound response to Claude Code
     if response.status_code < 400:
         request_stats.increment_success()
-        logger.info(f"✅ RESPONSE #{request_stats.total_requests}: {response.status_code} ({duration:.2f}s)")
+        logger.info(f"✅ INBOUND RESPONSE #{request_stats.total_requests}: {response.status_code} ({duration:.2f}s) -> Claude Code")
     else:
         request_stats.increment_failure()
-        logger.info(f"❌ RESPONSE #{request_stats.total_requests}: {response.status_code} ({duration:.2f}s)")
+        # For error responses, also log the response body if available
+        try:
+            if hasattr(response, 'body') and response.body:
+                import json
+                body_text = response.body.decode('utf-8') if isinstance(response.body, bytes) else str(response.body)
+                logger.info(f"❌ INBOUND RESPONSE #{request_stats.total_requests}: {response.status_code} ({duration:.2f}s) -> Claude Code - {body_text[:200]}")
+            else:
+                logger.info(f"❌ INBOUND RESPONSE #{request_stats.total_requests}: {response.status_code} ({duration:.2f}s) -> Claude Code")
+        except Exception:
+            logger.info(f"❌ INBOUND RESPONSE #{request_stats.total_requests}: {response.status_code} ({duration:.2f}s) -> Claude Code")
     
     return response
 
@@ -1114,12 +1334,15 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             len(litellm_request['messages']),
             num_tools, 200
         )
+        
+        # Detailed request logging to debug quota differences
+        logger.info(f"🔍 REQUEST DETAILS: original='{request.original_model}' -> effective='{litellm_request.get('model')}'")
+        logger.info(f"🔍 LITELLM PARAMS: model={litellm_request.get('model')}, max_tokens={litellm_request.get('max_tokens')}, stream={litellm_request.get('stream')}, tools={len(litellm_request.get('tools', []))}")
 
-        # Enhanced streaming with better retry logic
+        # Streaming - let errors bubble up directly to Claude Code
+
         if request.stream:
-            # Pre-calculate input tokens as they are not available in the stream.
-            # We use litellm.token_counter as it's the only way to get a non-zero, close-to-accurate count of input tokens for streaming calls.
-            # While tokenizer drift is a concern, this is a practical trade-off for useful logging and cost estimation.
+            # Pre-calculate input tokens for logging
             try:
                 input_tokens = litellm.token_counter(
                     model=litellm_request["model"],
@@ -1128,78 +1351,90 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             except Exception:
                 input_tokens = 0
 
-            streaming_retry_count = 0
-            max_retries = config.max_streaming_retries
-            
-            while streaming_retry_count <= max_retries:
+            # Test streaming response first to catch quota/rate limit errors BEFORE StreamingResponse
+            try:
+                logger.debug("Testing streaming response to catch quota errors early...")
+                response_generator = await litellm.acompletion(**litellm_request)
+                
+                # Test the first chunk to catch quota/rate limit errors before committing to streaming
+                first_chunk = None
                 try:
-                    logger.debug(f"Attempting streaming (attempt {streaming_retry_count + 1}/{max_retries + 1})")
+                    first_chunk = await response_generator.__anext__()
+                    logger.debug("✅ First chunk received successfully, starting streaming")
+                except Exception as first_chunk_error:
+                    error_str = str(first_chunk_error)
                     
-                    # Add slight delay between retries
-                    if streaming_retry_count > 0:
-                        delay = min(0.5 * (2 ** streaming_retry_count), 2.0)  # Exponential backoff, max 2s
-                        logger.debug(f"Waiting {delay}s before retry...")
-                        await asyncio.sleep(delay)
-                    
-                    response_generator = await litellm.acompletion(**litellm_request)
-                    
-                    return StreamingResponse(
-                        handle_streaming_with_recovery(response_generator, request, input_tokens),
-                        media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                            "X-Accel-Buffering": "no",
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Headers": "*"
-                        }
-                    )
-                    
-                except (litellm.exceptions.APIConnectionError, RuntimeError) as streaming_error:
-                    streaming_retry_count += 1
-                    error_msg = str(streaming_error)
-                    
-                    # Check for the specific malformed chunk error
-                    if ("Error parsing chunk" in error_msg and 
-                        "Expecting property name enclosed in double quotes" in error_msg):
+                    # Check if this is a quota/rate limit error
+                    if ("RateLimitError" in error_str or "RateLimitError" in type(first_chunk_error).__name__ or
+                        "rate limit" in error_str.lower() or "quota" in error_str.lower() or 
+                        "429" in error_str or "RESOURCE_EXHAUSTED" in error_str):
                         
-                        if streaming_retry_count <= max_retries:
-                            logger.warning(f"Gemini streaming chunk parsing error (attempt {streaming_retry_count}/{max_retries + 1}), retrying...")
-                            continue
-                        else:
-                            logger.error(f"Gemini streaming failed after {max_retries + 1} attempts due to malformed chunks, falling back to non-streaming")
-                            break
+                        logger.info(f"🚨 Quota/rate limit error detected on first chunk - returning HTTP status to Claude Code")
+                        http_exception = handle_quota_rate_limit_error(first_chunk_error, request, config)
+                        raise http_exception
                     else:
-                        # Other streaming errors - could be connection issues
-                        if streaming_retry_count <= max_retries:
-                            logger.warning(f"Streaming error (attempt {streaming_retry_count}/{max_retries + 1}): {error_msg}")
-                            continue
-                        else:
-                            logger.error(f"Streaming failed after {max_retries + 1} attempts, falling back to non-streaming")
-                            break
-                            
-                except Exception as unexpected_error:
-                    streaming_retry_count += 1
-                    logger.error(f"Unexpected streaming error (attempt {streaming_retry_count}/{max_retries + 1}): {unexpected_error}")
+                        # For other first-chunk errors, re-raise to fall back to non-streaming
+                        raise first_chunk_error
+                
+                # If we get here, streaming is working - create generator that includes first chunk
+                async def streaming_with_first_chunk():
+                    yield first_chunk
+                    async for chunk in response_generator:
+                        yield chunk
+                
+                return StreamingResponse(
+                    handle_streaming_with_recovery(streaming_with_first_chunk(), request, input_tokens),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive", 
+                        "X-Accel-Buffering": "no",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "*"
+                    }
+                )
+                
+            except Exception as streaming_error:
+                # This catches errors from the initial litellm.acompletion() call or first chunk test
+                error_str = str(streaming_error)
+                
+                # Check if this is a rate limit/quota error that we should return as HTTP status  
+                if ("RateLimitError" in error_str or "RateLimitError" in type(streaming_error).__name__ or
+                    "rate limit" in error_str.lower() or "quota" in error_str.lower() or 
+                    "429" in error_str or "RESOURCE_EXHAUSTED" in error_str):
                     
-                    if streaming_retry_count <= max_retries:
-                        continue
-                    else:
-                        logger.error(f"Streaming failed after {max_retries + 1} attempts due to unexpected errors, falling back to non-streaming")
-                        break
-            
-            # If we get here, streaming failed - fall back to non-streaming
-            logger.info("Falling back to non-streaming mode")
-            litellm_request["stream"] = False
+                    logger.info(f"🚨 Rate limit/quota error BEFORE streaming started - returning HTTP status to Claude Code")
+                    # Don't start StreamingResponse - return HTTPException directly to main endpoint
+                    http_exception = handle_quota_rate_limit_error(streaming_error, request, config)
+                    raise http_exception
+                else:
+                    # For other errors, fall back to non-streaming
+                    logger.info(f"Non-rate-limit streaming error, falling back to non-streaming: {streaming_error}")
+                    litellm_request["stream"] = False
         
-        # Non-streaming path (or fallback)
+        # Non-streaming path (or fallback) - no proxy retries, let Claude Code handle everything
         if not request.stream or litellm_request.get("stream") == False:
-            start_time = time.time()
-            litellm_response = await litellm.acompletion(**litellm_request)
-            logger.debug(f"✅ Response received: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
-            
-            anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
-            return anthropic_response
+            try:
+                start_time = time.time()
+                litellm_response = await litellm.acompletion(**litellm_request)
+                logger.debug(f"✅ Response received: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
+                
+                anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+                return anthropic_response
+                
+            except Exception as non_streaming_error:
+                error_str = str(non_streaming_error)
+                
+                # Check if this is a rate limit error
+                if ("RateLimitError" in error_str or "RateLimitError" in type(non_streaming_error).__name__ or
+                    "rate limit" in error_str.lower() or "quota" in error_str.lower() or 
+                    "429" in error_str or "RESOURCE_EXHAUSTED" in error_str):
+                    
+                    # Use centralized handler
+                    raise handle_quota_rate_limit_error(non_streaming_error, request, config)
+                else:
+                    # Re-raise non-rate-limit errors directly
+                    raise non_streaming_error
 
     except litellm.exceptions.APIError as e:
         logger.error(f"LiteLLM API Error: {e}")
@@ -1211,6 +1446,9 @@ async def create_message(request: MessagesRequest, raw_request: Request):
     except TimeoutError as e:
         logger.error(f"Timeout Error: {e}")
         raise HTTPException(status_code=504, detail="Request timeout. Please try again.")
+    except HTTPException:
+        # Re-raise HTTPExceptions (like our custom 503/429) without modification
+        raise
     except Exception as e:
         logger.error(f"Error processing request: {e}")
         error_msg = classify_gemini_error(str(e))

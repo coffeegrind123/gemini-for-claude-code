@@ -46,6 +46,8 @@ class ClaudeProxyCLI:
             'REQUEST_TIMEOUT': '90',
             'MAX_RETRIES': '2',
             'MAX_STREAMING_RETRIES': '12',
+            'MAX_RETRY_TIME': '60',
+            'MAX_SINGLE_RETRY_DELAY': '30',
             'FORCE_DISABLE_STREAMING': 'false',
             'EMERGENCY_DISABLE_STREAMING': 'false'
         }
@@ -169,9 +171,12 @@ class ClaudeProxyCLI:
             print(f"Error: server.py not found in {self.script_dir}")
             return
         
-        # Set environment variables
+        # Set environment variables (config file first, then environment overrides)
         env = os.environ.copy()
-        env.update(config)
+        # Start with config file values
+        for key, value in config.items():
+            if key not in env:  # Only set if not already in environment
+                env[key] = value
         
         if daemon:
             # Start server as daemon

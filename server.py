@@ -708,11 +708,13 @@ async def handle_streaming_with_recovery(response_generator, original_request: M
     
     # Send initial SSE events
     yield f"event: {Constants.EVENT_MESSAGE_START}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_START, 'message': {'id': message_id, 'type': 'message', 'role': Constants.ROLE_ASSISTANT, 'model': original_request.original_model or original_request.model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': input_tokens, 'output_tokens': 0}}})}\n\n"
-    
-    yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': 0, 'content_block': {'type': Constants.CONTENT_TEXT, 'text': ''}})}\n\n"
-    
+
+    # yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': 0, 'content_block': {'type': Constants.CONTENT_TEXT, 'text': ''}})}\n\n"
+
     yield f"event: {Constants.EVENT_PING}\ndata: {json.dumps({'type': Constants.EVENT_PING})}\n\n"
 
+    current_block_index = 0
+    current_block_type = None
     # Streaming state management
     all_chunks = []
     accumulated_text = ""
@@ -910,31 +912,49 @@ async def handle_streaming_with_recovery(response_generator, original_request: M
                     accumulated_text += delta_content_text
                     yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': delta_content_text}})}\n\n"
 
-                # Handle tool call deltas (your existing logic)
-                if delta_tool_calls:
-                    for tc_chunk in delta_tool_calls:
-                        if not (hasattr(tc_chunk, 'function') and tc_chunk.function and 
-                               hasattr(tc_chunk.function, 'name') and tc_chunk.function.name):
-                            continue
-                            
-                        tool_call_id = tc_chunk.id
-                        
-                        if tool_call_id not in current_tool_calls:
-                            tool_block_counter += 1
-                            tool_index = text_block_index + tool_block_counter
-                            
-                            current_tool_calls[tool_call_id] = {
-                                "index": tool_index,
-                                "name": tc_chunk.function.name or "",
-                                "args_buffer": tc_chunk.function.arguments or ""
-                            }
-                            
-                            yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': tool_index, 'content_block': {'type': Constants.CONTENT_TOOL_USE, 'id': tool_call_id, 'name': current_tool_calls[tool_call_id]['name'], 'input': {}}})}\n\n"
-                        
-                        if tc_chunk.function.arguments:
-                            current_tool_calls[tool_call_id]["args_buffer"] += tc_chunk.function.arguments
-                            yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': current_tool_calls[tool_call_id]['index'], 'delta': {'type': Constants.DELTA_INPUT_JSON, 'partial_json': tc_chunk.function.arguments}})}\n\n"
+                    # Handle tool call deltas (your existing logic)
+                    if delta_tool_calls:
+                        for tc in delta_tool_calls:
+                            tc_id = None
+                            tc_name = None
+                            tc_args = None
 
+                            if hasattr(tc, 'id'): tc_id = tc.id
+                            if hasattr(tc, 'function'):
+                                if hasattr(tc.function, 'name'): tc_name = tc.function.name
+                                if hasattr(tc.function, 'arguments'): tc_args = tc.function.arguments
+
+                            # Try getting from dictionary (Fallback)
+                            if isinstance(tc, dict):
+                                tc_id = tc.get('id', tc_id)
+                                func = tc.get('function', {})
+                                tc_name = func.get('name', tc_name)
+                                tc_args = func.get('arguments', tc_args)
+
+                            # Determine whether it is the start of a new tool call
+                            is_new_tool_start = False
+                            if tc_id or tc_name:
+                                is_new_tool_start = True
+
+                            if is_new_tool_start:
+                                # Close previous block
+                                if current_block_type is not None:
+                                    yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': current_block_index})}\n\n"
+                                    current_block_index += 1
+
+                                final_tool_id = tc_id or f"call_{uuid.uuid4().hex[:24]}"
+
+                                final_tool_name = tc_name or "unknown_tool"
+
+                                current_block_type = Constants.CONTENT_TOOL_USE
+                                current_tool_id = final_tool_id
+
+                                # Send Toolblock Start
+                                yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': current_block_index, 'content_block': {'type': Constants.CONTENT_TOOL_USE, 'id': final_tool_id, 'name': final_tool_name, 'input': {}}})}\n\n"
+
+                            # Arguments
+                            if tc_args and current_block_type == Constants.CONTENT_TOOL_USE:
+                                yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': current_block_index, 'delta': {'type': Constants.DELTA_INPUT_JSON, 'partial_json': tc_args}})}\n\n"
                 # Handle finish reason
                 if chunk_finish_reason:
                     if chunk_finish_reason == "length":
@@ -1015,7 +1035,10 @@ async def handle_streaming_with_recovery(response_generator, original_request: M
         final_response = litellm.stream_chunk_builder(all_chunks)
         if final_response and hasattr(final_response, 'usage'):
             output_tokens = getattr(final_response.usage, "completion_tokens", 0)
-        
+        # close
+        if current_block_type is not None:
+            yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': current_block_index})}\n\n"
+
         usage_data = {"input_tokens": input_tokens, "output_tokens": output_tokens}
         yield f"event: {Constants.EVENT_MESSAGE_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_DELTA, 'delta': {'stop_reason': final_stop_reason, 'stop_sequence': None}, 'usage': usage_data})}\n\n"
         yield f"event: {Constants.EVENT_MESSAGE_STOP}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_STOP})}\n\n"
